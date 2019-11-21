@@ -131,17 +131,104 @@ namespace LiteMQ
     ObjList free_candidates_;
   };
 
-  // DescriptorHandlerPoller::DescriptorHandlerHolder impl
-  DescriptorHandlerPoller::DescriptorHandlerHolder::DescriptorHandlerHolder(
+  // DescriptorHandler impl
+  void
+  DescriptorHandler::link_holder_(DescriptorHandlerHolder* descriptor_handler_holder)
+  {
+    Gears::Mutex::WriteGuard guard(linked_descriptor_handler_holders_lock_);
+
+    for(auto it = linked_descriptor_handler_holders_.begin();
+      it != linked_descriptor_handler_holders_.end(); ++it)
+    {
+      if(*it == descriptor_handler_holder)
+      {
+        return;
+      }
+    }
+
+    linked_descriptor_handler_holders_.push_back(descriptor_handler_holder);
+  }
+
+  void
+  DescriptorHandler::unlink_holder_(DescriptorHandlerHolder* descriptor_handler_holder)
+  {
+    Gears::Mutex::WriteGuard guard(linked_descriptor_handler_holders_lock_);
+    for(auto it = linked_descriptor_handler_holders_.begin();
+      it != linked_descriptor_handler_holders_.end(); ++it)
+    {
+      if(*it == descriptor_handler_holder)
+      {
+        linked_descriptor_handler_holders_.erase(it);
+        break;
+      }
+    }
+  }
+
+  void
+  DescriptorHandler::rearm(
+    bool handle_read,
+    bool handle_write)
+    throw()
+  {
+    Gears::Mutex::WriteGuard guard(linked_descriptor_handler_holders_lock_);
+    for(auto it = linked_descriptor_handler_holders_.begin();
+      it != linked_descriptor_handler_holders_.end(); ++it)
+    {
+      (*it)->rearm(handle_read, handle_write);
+    }
+  }
+
+  // DescriptorHandlerHolder impl
+  DescriptorHandlerHolder::DescriptorHandlerHolder(
+    DescriptorHandlerPoller* descriptor_handler_poller_val,
     const DescriptorHandler_var& descriptor_handler_val)
     throw()
-    : descriptor_handler(descriptor_handler_val),
+    : descriptor_handler_poller_(descriptor_handler_poller_val),
+      descriptor_handler_(descriptor_handler_val),
       handle_read(true),
       handle_write(true),
+      read_closed(false),
+      write_closed(false),
       handle_in_progress(0),
       handling_finished(0)
   {
-    assert(descriptor_handler_val);
+    assert(descriptor_handler_poller_);
+    assert(descriptor_handler_);
+    descriptor_handler_->link_holder_(this);
+  }
+
+  DescriptorHandlerHolder::~DescriptorHandlerHolder() throw()
+  {
+    reset_descriptor_handler();
+    destroyed = true;
+  }
+
+  DescriptorHandler*
+  DescriptorHandlerHolder::descriptor_handler() const throw()
+  {
+    return descriptor_handler_.get();
+  }
+
+  void
+  DescriptorHandlerHolder::reset_descriptor_handler() throw()
+  {
+    if(descriptor_handler_)
+    {
+      descriptor_handler_->unlink_holder_(this);
+      descriptor_handler_ = DescriptorHandler_var();
+    }
+  }
+
+  void
+  DescriptorHandlerHolder::rearm(
+    bool handle_read,
+    bool handle_write)
+    throw()
+  {
+    descriptor_handler_poller_->epoll_rearm_fd_(
+      this,
+      handle_read,
+      handle_write);    
   }
 
   // DescriptorHandlerPoller::StopPipeDescriptorHandler impl
@@ -399,7 +486,7 @@ namespace LiteMQ
       Gears::ExtendedTime now = Gears::Time::get_time_of_day().get_gm_time();
       ostr << now.format(TRACE_TIME_FORMAT) << "." << std::setfill('0') << std::setw(3) << (now.tm_usec / 1000) <<
         "> #" << thread_i <<
-        ": process fd(" << descriptor_handler_holder->descriptor_handler->fd() << "), events = " << events <<
+        ": process fd(" << descriptor_handler_holder->descriptor_handler()->fd() << "), events = " << events <<
         " =>" << (events & EPOLLIN ? " EPOLLIN" : "") <<
         (events & EPOLLOUT ? " EPOLLOUT" : "") <<
         (events & EPOLLRDHUP ? " EPOLLRDHUP" : "") <<
@@ -430,7 +517,7 @@ namespace LiteMQ
         Gears::ExtendedTime now = Gears::Time::get_time_of_day().get_gm_time();
         ostr << now.format(TRACE_TIME_FORMAT) << "." << std::setfill('0') << std::setw(3) << (now.tm_usec / 1000) <<
           "> #" << thread_i <<
-          ": real process fd(" << descriptor_handler_holder->descriptor_handler->fd() << "): " <<
+          ": real process fd(" << descriptor_handler_holder->descriptor_handler()->fd() << "): " <<
           events << "(in = " <<
           descriptor_handler_holder->handle_read << ", out = " <<
           descriptor_handler_holder->handle_write << ")" << std::endl;
@@ -438,7 +525,7 @@ namespace LiteMQ
       }
 
       DescriptorHandler* descriptor_handler =
-        descriptor_handler_holder->descriptor_handler.get();
+        descriptor_handler_holder->descriptor_handler();
 
       do
       {
@@ -520,10 +607,8 @@ namespace LiteMQ
           }
         }
 
-        // TODO: rearm here once instead rearm in apply_state_modify_
-        // TODO: don't close if not stopped
-        if(!descriptor_handler_holder->handle_read &&
-          !descriptor_handler_holder->handle_write)
+        if(descriptor_handler_holder->read_closed &&
+          descriptor_handler_holder->write_closed)
         {
           if(TRACE_POLLER_)
           {
@@ -545,7 +630,7 @@ namespace LiteMQ
           descriptor_handler->stopped();
 
           // minimize size of descriptor_handler_holder for keep in cleaner
-          descriptor_handler_holder->descriptor_handler = DescriptorHandler_var();
+          descriptor_handler_holder->reset_descriptor_handler();
 
           // add to clean list
           descriptor_handler_cleaner_->push(descriptor_handler_holder);
@@ -569,7 +654,7 @@ namespace LiteMQ
       // rearm descriptor_handler_holder(read only) inside thread, that made handling
       // but for exclude rearm by previous holder state (cached) make lock (memory barrier)
       Gears::Mutex::WriteGuard lock(descriptor_handler_holder->rearm_lock);
-      epoll_rearm_fd_(thread_i, descriptor_handler_holder.get());
+      epoll_rearm_handler_(thread_i, descriptor_handler_holder.get());
     }
 
     assert(prev_handle_in_progress >= 0);
@@ -667,35 +752,48 @@ namespace LiteMQ
   }
 
   void
-  DescriptorHandlerPoller::epoll_rearm_fd_(
+  DescriptorHandlerPoller::epoll_rearm_handler_(
     unsigned long thread_i,
     const DescriptorHandlerHolder* descriptor_handler_holder)
     const throw(Exception)
   {
-    static const char* FUN = "DescriptorHandlerPoller::epoll_rearm_fd_()";
+    //static const char* FUN = "DescriptorHandlerPoller::epoll_rearm_handler_()";
 
     if(TRACE_POLLER_)
     {
       std::ostringstream ostr;
       ostr << Gears::Time::get_time_of_day().get_gm_time().format(TRACE_TIME_FORMAT) << "> #" << thread_i <<
         ": rearm fd(" <<
-        descriptor_handler_holder->descriptor_handler->fd() << ")"
+        descriptor_handler_holder->descriptor_handler()->fd() << ")"
         ", handle_read = " << descriptor_handler_holder->handle_read <<
         ", handle_write = " << descriptor_handler_holder->handle_write <<
         std::endl;
       std::cerr << ostr.str() << std::endl;
     }
 
+    epoll_rearm_fd_(
+      descriptor_handler_holder,
+      descriptor_handler_holder->handle_read,
+      descriptor_handler_holder->handle_write);
+  }
+
+  void
+  DescriptorHandlerPoller::epoll_rearm_fd_(
+    const DescriptorHandlerHolder* descriptor_handler_holder,
+    bool handle_read,
+    bool handle_write)
+    const throw(Exception)
+  {
+    static const char* FUN = "DescriptorHandlerPoller::epoll_rearm_fd_()";
+
     epoll_event ev;
-    ev.events = EPOLL_FLAGS |
-      (descriptor_handler_holder->handle_read ? EPOLLIN : 0) |
-      (descriptor_handler_holder->handle_write ? EPOLLOUT : 0);
+    ev.events = EPOLL_FLAGS | (handle_read ? EPOLLIN : 0) | (handle_write ? EPOLLOUT : 0);
     ev.data.ptr = const_cast<void*>(static_cast<const void*>(descriptor_handler_holder));
 
     if(::epoll_ctl(
          epoll_fd_,
          EPOLL_CTL_MOD,
-         descriptor_handler_holder->descriptor_handler->fd(),
+         descriptor_handler_holder->descriptor_handler()->fd(),
          &ev) == -1)
     {
       Gears::throw_errno_exception<Exception>(errno, FUN, "epoll_ctl() failed");
@@ -712,7 +810,12 @@ namespace LiteMQ
     bool res_handle_read = descriptor_handler_holder->handle_read;
     bool res_handle_write = descriptor_handler_holder->handle_write;
 
-    if(state_modify & DescriptorHandler::START_READ_HANDLE)
+    if(state_modify & DescriptorHandler::CLOSE_READ_HANDLE)
+    {
+      res_handle_read = false;
+      descriptor_handler_holder->read_closed = true;
+    }
+    else if(state_modify & DescriptorHandler::START_READ_HANDLE)
     {
       res_handle_read = true;
     }
@@ -721,7 +824,12 @@ namespace LiteMQ
       res_handle_read = false;
     }
 
-    if(state_modify & DescriptorHandler::START_WRITE_HANDLE)
+    if(state_modify & DescriptorHandler::CLOSE_WRITE_HANDLE)
+    {
+      res_handle_read = false;
+      descriptor_handler_holder->write_closed = true;
+    }
+    else if(state_modify & DescriptorHandler::START_WRITE_HANDLE)
     {
       res_handle_write = true;
     }
@@ -797,7 +905,7 @@ namespace LiteMQ
     bool inserted;
 
     DescriptorHandlerHolder_var holder = DescriptorHandlerHolder_var(
-      new DescriptorHandlerHolder(desc_handler));
+      new DescriptorHandlerHolder(this, desc_handler));
 
     {
       SyncPolicy::WriteGuard lock(handlers_lock_);

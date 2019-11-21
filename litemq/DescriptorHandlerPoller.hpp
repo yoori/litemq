@@ -19,23 +19,34 @@
 
 namespace LiteMQ
 {
+  struct DescriptorHandlerHolder;
+
   //
   // DescriptorHandler
   //
   class DescriptorHandler
   {
   public:
+    friend class DescriptorHandlerHolder;
+
     DECLARE_EXCEPTION(Exception, Gears::DescriptiveException);
 
+    // by default after handle poller use handle flags, that installed before handle
     enum StateChange
     {
       CONTINUE_HANDLE = 0,
+
       STOP_READ_HANDLE = 1,
       START_READ_HANDLE = 2,
-      STOP_WRITE_HANDLE = 4,
-      START_WRITE_HANDLE = 8,
-      STOP_PROCESSING = 16, // full stop of handlers processing loop
-      STOP_HANDLE = STOP_READ_HANDLE | STOP_WRITE_HANDLE
+      CLOSE_READ_HANDLE = 4,
+
+      STOP_WRITE_HANDLE = 8,
+      START_WRITE_HANDLE = 16,
+      CLOSE_WRITE_HANDLE = 32,
+
+      STOP_PROCESSING = 64 // shutdown: full stop of handlers processing loop
+
+      //STOP_HANDLE = STOP_READ_HANDLE | STOP_WRITE_HANDLE
     };
 
   public:
@@ -51,10 +62,75 @@ namespace LiteMQ
     virtual void
     stopped() throw()
     {};
+
+    void
+    rearm(bool handle_read, bool handle_write) throw();
+
+  protected:
+    void
+    link_holder_(DescriptorHandlerHolder* descriptor_handler_holder);
+
+    void
+    unlink_holder_(DescriptorHandlerHolder* descriptor_handler_holder);
+
+  private:
+    Gears::Mutex linked_descriptor_handler_holders_lock_;
+    std::vector<DescriptorHandlerHolder*> linked_descriptor_handler_holders_;
   };
 
   typedef std::shared_ptr<DescriptorHandler>
     DescriptorHandler_var;
+
+  class DescriptorHandlerPoller;
+
+  struct DescriptorHandlerHolder:
+    public std::enable_shared_from_this<DescriptorHandlerHolder>
+  {
+  public:
+    // DescriptorHandlerHolder can be created only in DescriptorHandlerPoller
+    // and life only when live poller
+    DescriptorHandlerHolder(
+      DescriptorHandlerPoller* descriptor_handler_poller,
+      const DescriptorHandler_var& descriptor_handler)
+      throw();
+
+    virtual
+    ~DescriptorHandlerHolder() throw();
+
+    std::shared_ptr<DescriptorHandlerHolder>
+    get_ptr()
+    {
+      return shared_from_this();
+    }
+
+    DescriptorHandler*
+    descriptor_handler() const throw();
+
+    void
+    reset_descriptor_handler() throw();
+
+    void
+    rearm(bool handle_read, bool handle_write) throw();
+
+  protected:
+    DescriptorHandlerPoller* const descriptor_handler_poller_;
+    DescriptorHandler_var descriptor_handler_;
+
+  public:
+    bool handle_read;
+    bool handle_write;
+    bool read_closed;
+    bool write_closed;
+
+    std::atomic<int> handle_in_progress;
+    std::atomic<int> handling_finished;
+    bool destroyed;
+
+    mutable Gears::Mutex rearm_lock;
+  };
+
+  typedef std::shared_ptr<DescriptorHandlerHolder>
+    DescriptorHandlerHolder_var;
 
   //
   // DescriptorHandlerOwner
@@ -83,6 +159,8 @@ namespace LiteMQ
     public DescriptorHandlerOwner
   {
   public:
+    friend class DescriptorHandlerHolder;
+
     typedef DescriptorHandlerOwner::Exception Exception;
 
     class Proxy: public DescriptorHandlerOwner
@@ -169,39 +247,6 @@ namespace LiteMQ
     typedef std::shared_ptr<StopPipeDescriptorHandler>
       StopPipeDescriptorHandler_var;
 
-    struct DescriptorHandlerHolder:
-      public std::enable_shared_from_this<DescriptorHandlerHolder>
-    {
-    public:
-      DescriptorHandlerHolder(const DescriptorHandler_var& descriptor_handler)
-        throw();
-
-      virtual
-      ~DescriptorHandlerHolder() throw()
-      {
-        descriptor_handler = DescriptorHandler_var();
-        destroyed = true;
-      }
-
-      std::shared_ptr<DescriptorHandlerHolder>
-      get_ptr()
-      {
-        return shared_from_this();
-      }
-
-      DescriptorHandler_var descriptor_handler;
-      bool handle_read;
-      bool handle_write;
-      std::atomic<int> handle_in_progress;
-      std::atomic<int> handling_finished;
-      bool destroyed;
-
-      mutable Gears::Mutex rearm_lock;
-    };
-
-    typedef std::shared_ptr<DescriptorHandlerHolder>
-      DescriptorHandlerHolder_var;
-
     typedef std::unordered_map<DescriptorHandler*, DescriptorHandlerHolder_var>
       DescriptorHandlerMap;
 
@@ -229,9 +274,16 @@ namespace LiteMQ
       throw(Exception);
 
     void
-    epoll_rearm_fd_(
+    epoll_rearm_handler_(
       unsigned long thread_i,
       const DescriptorHandlerHolder* descriptor_handler_holder)
+      const throw(Exception);
+
+    void
+    epoll_rearm_fd_(
+      const DescriptorHandlerHolder* descriptor_handler_holder,
+      bool handle_read,
+      bool handle_write)
       const throw(Exception);
 
     bool
