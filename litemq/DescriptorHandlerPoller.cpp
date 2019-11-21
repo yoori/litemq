@@ -409,6 +409,9 @@ namespace LiteMQ
     }
 
     bool stop_processing = false;
+    // rearm fd outside of handling lock for exclude case, when
+    // rearm inside loop not processed in other thread that can't capture lock
+    bool rearm_fd = false;
 
     // lock handling - only one thread can call handlers
     // cleaner garantee that object live
@@ -441,10 +444,6 @@ namespace LiteMQ
       {
         assert(prev_handle_in_progress >= 0);
 
-        // signal epoll continue handling
-        // rearm with state flags, before handle
-        epoll_rearm_fd_(thread_i, descriptor_handler_holder.get());
-
         // call all handlers - it should detect
         // all event types (EPOLLIN, EPOLLOUT, EPOLLRDHUP, EPOLLERR)
         unsigned long state_modify_on_read = 0;
@@ -463,7 +462,9 @@ namespace LiteMQ
             std::cerr << ostr.str() << std::endl;
           }
 
+          // call handler
           state_modify_on_read = descriptor_handler->read();
+
           stop_processing |= apply_state_modify_(
             thread_i,
             descriptor_handler_holder.get(),
@@ -497,7 +498,9 @@ namespace LiteMQ
             std::cerr << ostr.str() << std::endl;
           }
 
+          // call handler
           state_modify_on_write = descriptor_handler->write();
+
           stop_processing |= apply_state_modify_(
             thread_i,
             descriptor_handler_holder.get(),
@@ -551,10 +554,22 @@ namespace LiteMQ
           handlers_.erase(descriptor_handler);
           break; // ignore other thread handles on stop
         }
+        else
+        {
+          rearm_fd = true;
+        }
       }
       // process handles appeared in other threads
       while((prev_handle_in_progress =
         descriptor_handler_holder->handle_in_progress--) > 1);
+    }
+
+    if(rearm_fd)
+    {
+      // rearm descriptor_handler_holder(read only) inside thread, that made handling
+      // but for exclude rearm by previous holder state (cached) make lock (memory barrier)
+      Gears::Mutex::WriteGuard lock(descriptor_handler_holder->rearm_lock);
+      epoll_rearm_fd_(thread_i, descriptor_handler_holder.get());
     }
 
     assert(prev_handle_in_progress >= 0);
@@ -654,7 +669,7 @@ namespace LiteMQ
   void
   DescriptorHandlerPoller::epoll_rearm_fd_(
     unsigned long thread_i,
-    DescriptorHandlerHolder* descriptor_handler_holder)
+    const DescriptorHandlerHolder* descriptor_handler_holder)
     const throw(Exception)
   {
     static const char* FUN = "DescriptorHandlerPoller::epoll_rearm_fd_()";
@@ -675,7 +690,7 @@ namespace LiteMQ
     ev.events = EPOLL_FLAGS |
       (descriptor_handler_holder->handle_read ? EPOLLIN : 0) |
       (descriptor_handler_holder->handle_write ? EPOLLOUT : 0);
-    ev.data.ptr = descriptor_handler_holder;
+    ev.data.ptr = const_cast<void*>(static_cast<const void*>(descriptor_handler_holder));
 
     if(::epoll_ctl(
          epoll_fd_,
@@ -694,7 +709,6 @@ namespace LiteMQ
     unsigned long state_modify)
     const throw()
   {
-    bool rearm = false;
     bool res_handle_read = descriptor_handler_holder->handle_read;
     bool res_handle_write = descriptor_handler_holder->handle_write;
 
@@ -716,17 +730,8 @@ namespace LiteMQ
       res_handle_write = false;
     }
 
-    // rearm if processing stopped (other threads can use rearm)
-    rearm = (res_handle_write != descriptor_handler_holder->handle_write) ||
-      (res_handle_read != descriptor_handler_holder->handle_read);
-
     descriptor_handler_holder->handle_read = res_handle_read;
     descriptor_handler_holder->handle_write = res_handle_write;
-
-    if(rearm)
-    {
-      epoll_rearm_fd_(thread_i, descriptor_handler_holder);
-    }
 
     return state_modify & DescriptorHandler::STOP_PROCESSING;
   }

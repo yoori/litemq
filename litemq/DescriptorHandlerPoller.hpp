@@ -42,11 +42,9 @@ namespace LiteMQ
     virtual int
     fd() const throw() = 0;
 
-    // return false if need stop loop
     virtual unsigned long
     read() throw(Exception) = 0;
 
-    // return false if need stop loop
     virtual unsigned long
     write() throw(Exception) = 0;
 
@@ -197,6 +195,8 @@ namespace LiteMQ
       std::atomic<int> handle_in_progress;
       std::atomic<int> handling_finished;
       bool destroyed;
+
+      mutable Gears::Mutex rearm_lock;
     };
 
     typedef std::shared_ptr<DescriptorHandlerHolder>
@@ -231,7 +231,7 @@ namespace LiteMQ
     void
     epoll_rearm_fd_(
       unsigned long thread_i,
-      DescriptorHandlerHolder* descriptor_handler_holder)
+      const DescriptorHandlerHolder* descriptor_handler_holder)
       const throw(Exception);
 
     bool
