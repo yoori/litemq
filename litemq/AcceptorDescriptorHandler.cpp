@@ -19,7 +19,7 @@ namespace LiteMQ
   {
     static const char* FUN = "AcceptorDescriptorHandler::AcceptorDescriptorHandler()";
 
-    fd_ = socket(AF_INET, SOCK_STREAM, 0);
+    fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
 
     if(fd_ < 0)
     {

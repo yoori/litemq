@@ -1,0 +1,13 @@
+project(ServerGearsHashServer)
+
+add_executable(ServerGearsHashServer
+  main.cpp
+  )
+
+target_link_libraries(ServerGearsHashServer
+  Gears
+  LiteMQ
+  ${CMAKE_THREAD_LIBS_INIT}
+  )
+
+install(TARGETS ServerGearsHashServer DESTINATION bin)

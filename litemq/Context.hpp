@@ -9,11 +9,22 @@ namespace LiteMQ
   // Context
   class Context: public Gears::CompositeActiveObject
   {
+    friend class Connection;
+
   public:
-    Context(const Gears::ActiveObjectCallback_var& active_object_callback);
+    DECLARE_EXCEPTION(Exception, Gears::DescriptiveException);
+
+    Context(
+      const Gears::ActiveObjectCallback_var& active_object_callback,
+      unsigned long threads_per_pool,
+      unsigned long pools);
 
     virtual
     ~Context() throw() = default;
+
+    virtual bool
+    add_handler(const DescriptorHandler_var& desc_handler)
+      throw(Exception);
 
   protected:
     DescriptorHandlerPollerPool_var descriptor_handler_poller_pool_;

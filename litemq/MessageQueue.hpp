@@ -23,23 +23,37 @@ namespace LiteMQ
   // MessageHolder
   struct MessageHolder
   {
-    MessageHolder(const Gears::Time& timeout_val, uint64_t request_id_val)
-      : timeout(timeout_val),
-        request_id(request_id_val)
+    MessageHolder(
+      const Gears::Time& push_time_val,
+      const Gears::Time& expire_time_val,
+      uint64_t request_id_val)
+      : push_time(push_time_val),
+        expire_time(expire_time_val),
+        request_id(request_id_val),
+        expired_(0)
     {}
 
-    virtual
-    std::pair<const void*, unsigned long>
-    capture() const = 0;
+    virtual const void*
+    data() const = 0;
+
+    virtual unsigned long
+    size() const = 0;
+
+    virtual unsigned long
+    plain_size() = 0;
 
     virtual bool
     expire() = 0;
 
-    virtual bool
-    plain_size() const = 0;
+    bool
+    need_to_send() const;
 
-    const Gears::Time timeout;
+    const Gears::Time push_time;
+    const Gears::Time expire_time;
     const uint64_t request_id;
+
+  protected:
+    mutable std::atomic<int> expired_;
   };
 
   typedef std::shared_ptr<MessageHolder> MessageHolder_var;
@@ -66,12 +80,18 @@ namespace LiteMQ
       const Gears::Time& timeout,
       unsigned long request_id);
 
+    void
+    push_front(const MessageHolderArray& messages);
+
     // return messages
     void
     pop(MessageHolderArray& result_messages, unsigned long send_size);
 
     void
     clear_timeouted(const Gears::Time& time);
+
+    Gears::Time
+    eldest_time() const;
 
   protected:
     template<typename MessageType, typename TimeoutCallbackType>
@@ -83,9 +103,11 @@ namespace LiteMQ
         const Gears::Time& timeout_val,
         uint64_t request_id_val);
 
-      virtual
-      std::pair<const void*, unsigned long>
-      capture() const;
+      virtual const void*
+      data() const ;
+
+      virtual unsigned long
+      size() const;
 
       virtual bool
       expire();
@@ -96,14 +118,12 @@ namespace LiteMQ
     protected:
       MessageType message_;
       TimeoutCallbackType timeout_callback_;
-      mutable std::atomic<int> captured_;
-      volatile unsigned long plain_size_;
     };
 
   protected:
     const unsigned long max_size_;
 
-    Gears::Mutex lock_;
+    mutable Gears::Mutex lock_;
     // queue in push order
     std::deque<MessageHolder_var> messages_;
     // messages with timeout order for clear timeouted
@@ -118,32 +138,40 @@ namespace LiteMQ
 
 namespace LiteMQ
 {
+  inline
+  bool
+  MessageHolder::need_to_send() const
+  {
+    return expired_.load();
+  }
+
   // MessageQueue::MessageHolderImpl impl
   template<typename MessageType, typename TimeoutCallbackType>
   MessageQueue::
   MessageHolderImpl<MessageType, TimeoutCallbackType>::MessageHolderImpl(
     MessageType message,
     TimeoutCallbackType timeout_callback,
-    const Gears::Time& timeout_val,
+    const Gears::Time& expire_time_val,
     uint64_t request_id_val)
-    : MessageHolder(timeout_val, request_id_val),
+    : MessageHolder(Gears::Time::get_time_of_day(), expire_time_val, request_id_val),
       message_(std::move(message)),
-      timeout_callback_(timeout_callback),
-      captured_(0),
-      plain_size_(4 + 8 + message.size())
+      timeout_callback_(timeout_callback)
   {}
 
   template<typename MessageType, typename TimeoutCallbackType>
-  std::pair<const void*, unsigned long>
+  const void*
   MessageQueue::
-  MessageHolderImpl<MessageType, TimeoutCallbackType>::capture() const
+  MessageHolderImpl<MessageType, TimeoutCallbackType>::data() const
   {
-    if(++captured_ == 1)
-    {
-      return std::make_pair(message_.data(), message_.size());
-    }
+    return message_.data();
+  }
 
-    return std::make_pair(static_cast<const void*>(0), 0ul);
+  template<typename MessageType, typename TimeoutCallbackType>
+  unsigned long
+  MessageQueue::
+  MessageHolderImpl<MessageType, TimeoutCallbackType>::size() const
+  {
+    return message_.size();
   }
 
   template<typename MessageType, typename TimeoutCallbackType>
@@ -151,10 +179,9 @@ namespace LiteMQ
   MessageQueue::
   MessageHolderImpl<MessageType, TimeoutCallbackType>::expire()
   {
-    if(++captured_ == 1)
+    if(++expired_ == 1)
     {
       timeout_callback_();
-      message_ = MessageType();
       return true;
     }
 
@@ -166,14 +193,7 @@ namespace LiteMQ
   MessageQueue::
   MessageHolderImpl<MessageType, TimeoutCallbackType>::plain_size()
   {
-    if(++captured_ == 1)
-    {
-      timeout_callback_();
-      message_ = MessageType();
-      return true;
-    }
-
-    return false;
+    return size() + 4;
   }
 
   // MessageQueue impl
@@ -185,12 +205,12 @@ namespace LiteMQ
   bool
   MessageQueue::add(MessageType message)
   {
-    if(++message_count_ < max_size_)
+    if(++message_count_ < static_cast<int>(max_size_))
     {
       // generate request_id
       MessageHolder_var new_msg_holder(
         new MessageHolderImpl<MessageType, void()>(
-          message, null_timeout_callback, Gears::Time::ZERO, 0));
+          message, &null_timeout_callback, Gears::Time::ZERO, 0));
 
       {
         Gears::Mutex::WriteGuard lock(lock_);
@@ -239,6 +259,40 @@ namespace LiteMQ
   }
 
   void
+  MessageQueue::push_front(const MessageHolderArray& messages)
+  {
+    message_count_ += messages.size();
+    MessageHolderArray erase_messages;
+
+    if(message_count_ > static_cast<int>(max_size_))
+    {
+      erase_messages.reserve(messages.size());
+    }
+
+    {
+      Gears::Mutex::WriteGuard lock(lock_);
+      messages_.insert(messages_.begin(), messages.begin(), messages.end());
+      if(messages_.size() > max_size_)
+      {
+        for(auto it = messages_.end() - (messages_.size() - max_size_);
+          it != messages_.end(); ++it)
+        {
+          erase_messages.emplace_back(std::move(*it));
+        }
+        
+        messages_.erase(
+          messages_.end() - (messages_.size() - max_size_),
+          messages_.end());
+      }
+    }
+
+    for(auto it = erase_messages.begin(); it != erase_messages.end(); ++it)
+    {
+      (*it)->expire();
+    }
+  }
+
+  void
   MessageQueue::clear_timeouted(const Gears::Time& time)
   {
     std::vector<MessageHolder_var> expire_messages;
@@ -271,7 +325,7 @@ namespace LiteMQ
     // result_messages.reserve();
     unsigned long cur_size = 0;
 
-    Gears::Mutex::WriteGuard lock(lock_);
+    Gears::Mutex::WriteGuard guard(lock_);
     auto it = messages_.begin();
     for(; it != messages_.end(); ++it)
     {
@@ -284,6 +338,21 @@ namespace LiteMQ
     }
 
     messages_.erase(messages_.begin(), ++it);
+  }
+
+  Gears::Time
+  MessageQueue::eldest_time() const
+  {
+    Gears::Mutex::WriteGuard guard(lock_);
+
+    if(messages_.empty())
+    {
+      return Gears::Time::ZERO;
+    }
+    else
+    {
+      return (*messages_.begin())->push_time;
+    }
   }
 };
 

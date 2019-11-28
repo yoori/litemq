@@ -62,6 +62,12 @@ IF (CXX11)
     SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++0x -Wno-deprecated -DBOOST_SYSTEM_NO_DEPRECATED")
 ENDIF()
 
+find_package(Threads REQUIRED)
+
+IF (CMAKE_USE_PTHREADS_INIT)
+  SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
+ENDIF()
+
 set(CMAKE_CXX_FLAGS_DEBUG "-g")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 
@@ -112,8 +118,8 @@ add_subdirectory(src)
 add_subdirectory(litemq)
 
 add_dependencies(LiteMQ Gears)
-add_dependencies(ServerGearsHashServer Gears)
-add_dependencies(ServerGearsHashServer LiteMQ)
+add_dependencies(LiteMQClient LiteMQ)
+add_dependencies(LiteMQServer LiteMQ)
 
 install(DIRECTORY etc/ DESTINATION etc/
   FILES_MATCHING

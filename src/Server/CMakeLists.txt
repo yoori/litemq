@@ -1,12 +1,13 @@
-project(ServerGearsHashServer)
+project(LiteMQServer)
 
-add_executable(ServerGearsHashServer
+add_executable(LiteMQServer
   main.cpp
   )
 
-target_link_libraries(ServerGearsHashServer
+target_link_libraries(LiteMQServer
   Gears
   LiteMQ
-  pthread)
+  ${CMAKE_THREAD_LIBS_INIT}
+  )
 
-install(TARGETS ServerGearsHashServer DESTINATION bin)
+install(TARGETS LiteMQServer DESTINATION bin)

@@ -180,8 +180,8 @@ namespace
       {
         // connection closed
         //std::cerr << "connection closed" << std::endl;
-        return static_cast<unsigned long>(STOP_READ_HANDLE) | (
-          !write_bufs_.empty() ? START_WRITE_HANDLE : STOP_WRITE_HANDLE);
+        return static_cast<unsigned long>(CLOSE_READ_HANDLE) | (
+          !write_bufs_.empty() ? START_WRITE_HANDLE : CLOSE_WRITE_HANDLE);
       }
 
       // some bytes got
@@ -260,7 +260,7 @@ namespace
   unsigned long
   HashConnectionDescriptorHandler::error_() throw(Exception)
   {
-    return static_cast<unsigned long>(STOP_READ_HANDLE) | STOP_WRITE_HANDLE;
+    return static_cast<unsigned long>(CLOSE_READ_HANDLE) | CLOSE_WRITE_HANDLE;
   }
 
   void
